@@ -1,5 +1,7 @@
 # esp-wifi-jammer-detector
 
+> 🇨🇳 **中文文档导航**：[目录树与架构总览 (`README_CN.md`)](README_CN.md) | [项目深度解析、微雪板上手与跨芯片魔改移植指南 (`项目讲解与魔改移植指南.md`)](项目讲解与魔改移植指南.md)
+
 A **receive-only** 2.4 GHz + 5 GHz RF interference / possible-jamming detector
 for the Waveshare **ESP32-C5-Touch-LCD-3.5**. It uses the ESP32-C5's own Wi-Fi
 receiver as a snapshot SDR (via [ESPARGOS esp-sdr](https://github.com/ESPARGOS/esp-sdr))
