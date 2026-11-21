@@ -13,10 +13,17 @@ Connects over USB Serial/JTAG using the JSON Lines link protocol (link.c):
 Usage:
     python tools/pc_viewer.py --port COM5
     python tools/pc_viewer.py                  # auto-detect ESP32-C5 USB port
+
+Every session is logged to a JSONL file (logs/pc_viewer_<ts>.jsonl) for
+later analysis: all link messages ("rx"), every command sent ("tx") and
+raw device console lines ("dev"), each with a timestamp. Disable with
+--no-log, or point elsewhere with --log FILE. -v echoes device logs and
+commands to the terminal; alarm events are always echoed.
 """
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -56,13 +63,20 @@ def auto_detect_port() -> str | None:
 
 
 class LinkClient:
-    def __init__(self, port: str, baud: int = 115200):
+    def __init__(self, port: str, baud: int = 115200, log_path: str | None = None,
+                 verbose: bool = False):
         self.port = port
         self.baud = baud
         self.ser = serial.Serial(port, baud, timeout=0.1)
         self.lock = threading.Lock()
         self.running = True
         self.cmd_id = 1
+        self.verbose = verbose
+        self.log_file = None
+        self._log_lock = threading.Lock()
+        if log_path:
+            os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+            self.log_file = open(log_path, "a", encoding="utf-8", buffering=1)
 
         self.active_band = "2.4"
         self.hello: dict = {}
@@ -80,12 +94,32 @@ class LinkClient:
         self._rx_thread.start()
         self._tx_thread.start()
 
+    def _log(self, kind: str, data):
+        """Append one JSONL record to the session log; callable from any thread.
+
+        Record shape: {"ts": <unix s>, "iso": <local time>, "rx"|"tx"|"dev": ...}
+        - "rx": link-protocol message (dict) received from the device
+        - "tx": command (dict) sent to the device
+        - "dev": raw device console line (e.g. ESP_LOG), as a string
+        """
+        if not self.log_file:
+            return
+        rec = {"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%S"), kind: data}
+        with self._log_lock:
+            try:
+                self.log_file.write(json.dumps(rec, separators=(",", ":")) + "\n")
+            except Exception:
+                pass
+
     def send_cmd(self, cmd: str, **kwargs) -> int:
         with self.lock:
             cid = self.cmd_id
             self.cmd_id += 1
         payload = {"c": cmd, "id": cid}
         payload.update(kwargs)
+        self._log("tx", payload)
+        if self.verbose:
+            print(f"> {payload}")
         line = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
         try:
             self.ser.write(line)
@@ -122,12 +156,20 @@ class LinkClient:
             while b"\n" in buf:
                 raw, buf = buf.split(b"\n", 1)
                 line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
                 if not line.startswith('{"t":'):
+                    # device console output (ESP_LOG etc.) shares the USB port
+                    self._log("dev", line)
+                    if self.verbose:
+                        print(f"[dev] {line}")
                     continue
                 try:
                     msg = json.loads(line)
                 except json.JSONDecodeError:
+                    self._log("dev", line)  # keep malformed lines for forensics
                     continue
+                self._log("rx", msg)
                 self._handle_msg(msg)
 
     def _handle_msg(self, msg: dict):
@@ -147,6 +189,7 @@ class LinkClient:
                     f"({msg.get('kind')}, floor {msg.get('floor_db', 0):+.1f} dB)"
                 )
                 self.events.append(ev_str)
+                print(f"[{time.strftime('%H:%M:%S')}] {ev_str}")
             elif t == "spec":
                 band = msg.get("band", "2.4")
                 avg = np.array(msg.get("avg", []), dtype=np.float32) / 10.0
@@ -175,12 +218,22 @@ class LinkClient:
             self.ser.close()
         except Exception:
             pass
+        if self.log_file:
+            try:
+                self.log_file.close()
+            except Exception:
+                pass
 
 
 def main():
     parser = argparse.ArgumentParser(description="ESP-WiFi-Jam-Detector PC Spectrum Viewer")
     parser.add_argument("--port", "-p", help="Serial port (e.g. COM5, /dev/ttyACM0)")
     parser.add_argument("--baud", "-b", type=int, default=115200, help="Baud rate")
+    parser.add_argument("--log", metavar="FILE",
+                        help="JSONL session log file (default: logs/pc_viewer_<date>_<time>.jsonl)")
+    parser.add_argument("--no-log", action="store_true", help="Disable session logging")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Echo device console (ESP_LOG) lines and TX commands to the terminal")
     args = parser.parse_args()
 
     port = args.port or auto_detect_port()
@@ -188,8 +241,13 @@ def main():
         print("No serial port found. Connect the ESP32-C5 board or pass --port COMx.")
         sys.exit(1)
 
-    print(f"Connecting to {port} ...")
-    client = LinkClient(port, args.baud)
+    log_path = None
+    if not args.no_log:
+        log_path = args.log or os.path.join(
+            "logs", time.strftime("pc_viewer_%Y%m%d_%H%M%S.jsonl"))
+    print(f"Connecting to {port} ..."
+          + (f"  logging to {log_path}" if log_path else "  (logging disabled)"))
+    client = LinkClient(port, args.baud, log_path=log_path, verbose=args.verbose)
 
     plt.style.use("dark_background")
     fig = plt.figure(figsize=(12, 7.6), facecolor="#0f172a")
