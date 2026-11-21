@@ -1,22 +1,100 @@
 /*
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * Codec set-up follows Waveshare's BSP bsp_audio_codec_init() and the
- * factory app's playback (see board_pins.h), DAC path only.
+ * Alarm beeps:
+ *   - Touch-LCD-3.5: ES8311 codec + NS4150B amplifier over I2S.
+ *   - C5-MINI-KIT-U: optional passive piezo buzzer driven by hardware LEDC PWM
+ *     (zero I2S/DMA overhead, < 2 us register toggle).
  */
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
-#include "driver/i2s_std.h"
 #include "esp_check.h"
-#include "esp_codec_dev.h"
-#include "esp_codec_dev_defaults.h"
 #include "esp_log.h"
-#include "board.h"
-#include "board_pins.h"
 #include "audio.h"
 
 static const char *TAG = "audio";
+
+typedef struct {
+    uint16_t count, on_ms, off_ms;
+} pattern_t;
+
+static QueueHandle_t s_queue;
+
+#if CONFIG_JD_BOARD_C5_MINI_KIT
+
+#include "driver/ledc.h"
+
+#define BUZZER_TASK_PRIO  2
+#define BUZZER_TASK_STACK 2048
+#define BUZZER_DUTY_ON    128 /* 50% of 8-bit LEDC resolution */
+
+#if CONFIG_JD_BUZZER_GPIO >= 0
+static void buzzer_set(bool on)
+{
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, on ? BUZZER_DUTY_ON : 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
+static void buzzer_task(void *arg)
+{
+    (void)arg;
+    pattern_t p;
+    for (;;) {
+        if (xQueueReceive(s_queue, &p, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        for (unsigned i = 0; i < p.count; i++) {
+            buzzer_set(true);
+            vTaskDelay(pdMS_TO_TICKS(p.on_ms));
+            buzzer_set(false);
+            if (i + 1 < p.count && p.off_ms) {
+                vTaskDelay(pdMS_TO_TICKS(p.off_ms));
+            }
+        }
+    }
+}
+#endif
+
+esp_err_t audio_init(void)
+{
+#if CONFIG_JD_BUZZER_GPIO >= 0
+    const ledc_timer_config_t tcfg = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_8_BIT,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = CONFIG_JD_BUZZER_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_RETURN_ON_ERROR(ledc_timer_config(&tcfg), TAG, "ledc timer");
+    const ledc_channel_config_t ccfg = {
+        .gpio_num = CONFIG_JD_BUZZER_GPIO,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    ESP_RETURN_ON_ERROR(ledc_channel_config(&ccfg), TAG, "ledc channel");
+    s_queue = xQueueCreate(1, sizeof(pattern_t));
+    ESP_RETURN_ON_FALSE(s_queue, ESP_ERR_NO_MEM, TAG, "queue");
+    ESP_RETURN_ON_FALSE(xTaskCreate(buzzer_task, "buzzer", BUZZER_TASK_STACK, NULL, BUZZER_TASK_PRIO, NULL) == pdPASS,
+                        ESP_ERR_NO_MEM, TAG, "task");
+    ESP_LOGI(TAG, "LEDC PWM buzzer ready on GPIO%d (%d Hz)", CONFIG_JD_BUZZER_GPIO, CONFIG_JD_BUZZER_FREQ_HZ);
+#else
+    ESP_LOGI(TAG, "buzzer disabled (CONFIG_JD_BUZZER_GPIO < 0)");
+#endif
+    return ESP_OK;
+}
+
+#else /* !CONFIG_JD_BOARD_C5_MINI_KIT */
+
+#include "driver/i2s_std.h"
+#include "esp_codec_dev.h"
+#include "esp_codec_dev_defaults.h"
+#include "board.h"
+#include "board_pins.h"
 
 #define RATE_HZ    16000
 #define TONE_HZ    2000  /* RATE_HZ / 8: one period is 8 samples */
@@ -30,12 +108,7 @@ static const char *TAG = "audio";
 #define TASK_STACK 3072
 #define PA_SETTLE_MS 10
 
-typedef struct {
-    uint16_t count, on_ms, off_ms;
-} pattern_t;
-
 static esp_codec_dev_handle_t s_codec;
-static QueueHandle_t s_queue;
 
 /* sin(2 pi k / 8) * 2^15 */
 static const int16_t s_sine8[8] = {0, 23170, 32767, 23170, 0, -23170, -32767, -23170};
@@ -147,6 +220,8 @@ esp_err_t audio_init(void)
     ESP_LOGI(TAG, "ES8311 ready (%u Hz tone, volume %u)", TONE_HZ, VOLUME);
     return ESP_OK;
 }
+
+#endif /* CONFIG_JD_BOARD_C5_MINI_KIT */
 
 void audio_beep(unsigned count, unsigned on_ms, unsigned off_ms)
 {
