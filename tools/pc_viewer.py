@@ -207,6 +207,7 @@ def main():
     ax_spec.set_ylabel("Rel. Power (dB)")
     ax_spec.grid(True, alpha=0.2, color="#94a3b8")
     ax_spec.legend(loc="upper right", frameon=True, facecolor="#1e293b", edgecolor="#334155")
+    spec_title = ax_spec.set_title("Live Spectrum", fontsize=10, color="#e2e8f0")
 
     wf_img = ax_wf.imshow(
         np.full((WATERFALL_ROWS, SPEC_POINTS), 20.0, dtype=np.float32),
@@ -220,14 +221,21 @@ def main():
     ax_wf.set_xlabel("Frequency (MHz)")
     ax_wf.set_ylabel("Time (newest top)")
 
-    # Header status text
-    title_text = fig.text(
-        0.07, 0.945, f"ESP-WiFi-Jam-Detector  |  Port: {port}  |  Connecting...",
-        fontsize=12, fontweight="bold", color="#f8fafc",
+    # Header status text, on its own invisible axes: figure-level texts have
+    # no .axes and crash FuncAnimation's blit path on matplotlib >= 3.11.
+    ax_hdr = fig.add_axes([0.0, 0.83, 1.0, 0.17])
+    ax_hdr.set_axis_off()
+    ax_hdr.set_facecolor("none")
+    title_text = ax_hdr.text(
+        0.07, 0.68, f"ESP-WiFi-Jam-Detector  |  Port: {port}  |  Connecting...",
+        transform=ax_hdr.transAxes, fontsize=12, fontweight="bold", color="#f8fafc",
     )
-    status_24_text = fig.text(0.07, 0.895, "2.4 GHz: --", fontsize=10, color="#cbd5e1")
-    status_5_text = fig.text(0.50, 0.895, "5 GHz: --", fontsize=10, color="#cbd5e1")
-    event_text = fig.text(0.07, 0.855, "Events: (none)", fontsize=9, color="#94a3b8")
+    status_24_text = ax_hdr.text(0.07, 0.38, "2.4 GHz: --", transform=ax_hdr.transAxes,
+                                 fontsize=10, color="#cbd5e1")
+    status_5_text = ax_hdr.text(0.50, 0.38, "5 GHz: --", transform=ax_hdr.transAxes,
+                                fontsize=10, color="#cbd5e1")
+    event_text = ax_hdr.text(0.07, 0.15, "Events: (none)", transform=ax_hdr.transAxes,
+                             fontsize=9, color="#94a3b8")
 
     # Control buttons along the bottom
     btn_specs = [
@@ -275,6 +283,19 @@ def main():
     buttons[3].on_clicked(on_autorange)
     buttons[4].on_clicked(on_beep)
     buttons[5].on_clicked(on_clear_wf)
+
+    # Blit state: only these artists are redrawn each frame; everything else
+    # (axes, grid, legend, buttons, static text) lives in the cached background.
+    blit_artists = (
+        line_avg, line_max, line_base, wf_img, spec_title,
+        title_text, status_24_text, status_5_text, event_text,
+    )
+    # The x-axis/extent only change on a band switch; the y-range is latched
+    # (grows on demand, shrinks only when both ends are well inside) so the
+    # background rarely needs re-capturing.
+    layout = [None]
+    y_lo = [None]
+    y_hi = [None]
 
     def update(_frame):
         with client.lock:
@@ -324,18 +345,33 @@ def main():
             else:
                 line_base.set_data([], [])
 
-            ax_spec.set_xlim(spec["f0"], spec["f1"])
-            valid_vals = np.concatenate([spec["avg"], spec["max"]])
-            lo = float(np.nanmin(valid_vals)) - 5.0
-            hi = float(np.nanmax(valid_vals)) + 8.0
-            if hi - lo < 25.0:
-                hi = lo + 25.0
-            ax_spec.set_ylim(lo, hi)
-            ax_spec.set_title(
-                f"{band} GHz Live Spectrum  (gain={spec['gain']}, sweeps={spec['sweeps']})",
-                fontsize=10,
-                color="#e2e8f0",
+            spec_title.set_text(
+                f"{band} GHz Live Spectrum  (gain={spec['gain']}, sweeps={spec['sweeps']})"
             )
+            valid_vals = np.concatenate([spec["avg"], spec["max"]])
+            dmin = float(np.nanmin(valid_vals))
+            dmax = float(np.nanmax(valid_vals))
+            relayout = False
+            if layout[0] != (band, spec["f0"], spec["f1"]):
+                layout[0] = (band, spec["f0"], spec["f1"])
+                ax_spec.set_xlim(spec["f0"], spec["f1"])
+                wf_img.set_extent([spec["f0"], spec["f1"], WATERFALL_ROWS, 0])
+                relayout = True
+            # Latched y-range: grow with 10 dB headroom rounded to 5 dB steps
+            # (so noise spikes rarely retrigger), shrink only with hysteresis.
+            if y_lo[0] is None or dmin < y_lo[0] or dmax > y_hi[0] or (
+                dmin > y_lo[0] + 10.0 and dmax < y_hi[0] - 10.0
+            ):
+                y_lo[0] = float(np.floor((dmin - 10.0) / 5.0) * 5.0)
+                y_hi[0] = float(np.ceil((dmax + 10.0) / 5.0) * 5.0)
+                if y_hi[0] - y_lo[0] < 30.0:
+                    y_hi[0] = y_lo[0] + 30.0
+                ax_spec.set_ylim(y_lo[0], y_hi[0])
+                relayout = True
+            if relayout:
+                # Synchronous repaint: refreshes ticks/grid, and the blit cache
+                # re-captures this axes' background same frame (view changed).
+                fig.canvas.draw()
 
             finite = wf[np.isfinite(wf)]
             if finite.size:
@@ -345,11 +381,13 @@ def main():
                     vmax = vmin + 15.0
                 wf_img.set_clim(vmin, vmax)
             wf_img.set_data(wf)
-            wf_img.set_extent([spec["f0"], spec["f1"], WATERFALL_ROWS, 0])
 
-        return line_avg, line_max, line_base, wf_img
+        return blit_artists
 
-    _anim = FuncAnimation(fig, update, interval=200, blit=False, cache_frame_data=False)
+    _anim = FuncAnimation(
+        fig, update, init_func=lambda: blit_artists, interval=200,
+        blit=True, cache_frame_data=False,
+    )
     try:
         plt.show()
     finally:
