@@ -21,17 +21,26 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
+#include "sdkconfig.h"
 #include "board.h"
 #include "detector.h"
 #include "link.h"
 #include "link_proto.h"
+#include "params.h"
 #include "settings.h"
 #include "sweep.h"
+#if !CONFIG_JD_BOARD_C5_MINI_KIT
 #include "ui.h"
+#endif
 
 static const char *TAG = "link";
 
+#if CONFIG_JD_BOARD_C5_MINI_KIT
+#define MODEL           "ESP32-C5-MINI-KIT-U"
+#else
 #define MODEL           "ESP32-C5-Touch-LCD-3.5"
+#endif
+#define SPEC_PTS        100  /* downsampled spectrum points per USB frame (~1.4 KB) */
 #define QUEUE_LEN       8
 #define TASK_PRIO       2
 #define WRITE_PRIO      12   /* while holding the radio-quiet token (as eventlog.c) */
@@ -46,7 +55,7 @@ static const char *TAG = "link";
 #define TX_BUF          2048 /* driver ring buffers (logs share the TX one) */
 #define RX_BUF          512
 
-typedef enum { ITEM_EVENT, ITEM_HELLO, ITEM_ACK } item_kind_t;
+typedef enum { ITEM_EVENT, ITEM_HELLO, ITEM_ACK, ITEM_SPEC } item_kind_t;
 
 typedef struct {
     item_kind_t kind;
@@ -140,6 +149,72 @@ static void send_status(void)
     send_line(link_fmt_status(s_line, sizeof(s_line), &s));
 }
 
+static void send_spec(band_id_t band)
+{
+    static int16_t avg[SPEC_PTS], mx[SPEC_PTS], base[SPEC_PTS];
+    const band_plan_t *p = sweep_plan(band);
+    if (!p) {
+        return;
+    }
+    unsigned gain = 0;
+    uint32_t sweeps = 0;
+    bool valid = false, base_ok = false;
+    if (sweep_get_summary(band, SPEC_PTS, avg, mx, &gain, &sweeps, &valid) != ESP_OK || !valid) {
+        return;
+    }
+    detector_get_baseline_summary(band, SPEC_PTS, base, &base_ok);
+
+    size_t pos = 0;
+    int n = snprintf(s_line + pos, sizeof(s_line) - pos,
+                     "{\"t\":\"spec\",\"v\":%d,\"band\":\"%s\",\"f0_khz\":%u,\"f1_khz\":%u,\"gain\":%u,"
+                     "\"sweeps\":%u,\"n\":%u,\"avg\":[",
+                     LINK_PROTO_VERSION, link_band_name(band), (unsigned)p->start_khz, (unsigned)p->stop_khz,
+                     gain, (unsigned)sweeps, (unsigned)SPEC_PTS);
+    if (n <= 0 || (size_t)n >= sizeof(s_line) - pos) {
+        return;
+    }
+    pos += (size_t)n;
+    for (unsigned i = 0; i < SPEC_PTS; i++) {
+        n = snprintf(s_line + pos, sizeof(s_line) - pos, "%s%d", i ? "," : "", (int)(avg[i] / 10));
+        if (n <= 0 || (size_t)n >= sizeof(s_line) - pos) {
+            return;
+        }
+        pos += (size_t)n;
+    }
+    n = snprintf(s_line + pos, sizeof(s_line) - pos, "],\"max\":[");
+    if (n <= 0 || (size_t)n >= sizeof(s_line) - pos) {
+        return;
+    }
+    pos += (size_t)n;
+    for (unsigned i = 0; i < SPEC_PTS; i++) {
+        n = snprintf(s_line + pos, sizeof(s_line) - pos, "%s%d", i ? "," : "", (int)(mx[i] / 10));
+        if (n <= 0 || (size_t)n >= sizeof(s_line) - pos) {
+            return;
+        }
+        pos += (size_t)n;
+    }
+    if (base_ok) {
+        n = snprintf(s_line + pos, sizeof(s_line) - pos, "],\"base\":[");
+        if (n <= 0 || (size_t)n >= sizeof(s_line) - pos) {
+            return;
+        }
+        pos += (size_t)n;
+        for (unsigned i = 0; i < SPEC_PTS; i++) {
+            n = snprintf(s_line + pos, sizeof(s_line) - pos, "%s%d", i ? "," : "", (int)(base[i] / 10));
+            if (n <= 0 || (size_t)n >= sizeof(s_line) - pos) {
+                return;
+            }
+            pos += (size_t)n;
+        }
+    }
+    n = snprintf(s_line + pos, sizeof(s_line) - pos, "]}\n");
+    if (n <= 0 || (size_t)n >= sizeof(s_line) - pos) {
+        return;
+    }
+    pos += (size_t)n;
+    send_line(pos);
+}
+
 static void send_item(const item_t *it)
 {
     switch (it->kind) {
@@ -152,6 +227,9 @@ static void send_item(const item_t *it)
         break;
     case ITEM_ACK:
         send_line(link_fmt_ack(s_line, sizeof(s_line), it->id, it->err));
+        break;
+    case ITEM_SPEC:
+        send_spec(it->band);
         break;
     }
 }
@@ -184,6 +262,33 @@ static void writer_task(void *arg)
     }
 }
 
+#if CONFIG_JD_BOARD_C5_MINI_KIT
+static esp_err_t apply_setting_headless(const char *key, int value)
+{
+    settings_t set;
+    settings_get(&set);
+    if (param_set_key(&set, key, value) != 0 || settings_check(&set) != 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const unsigned w[BAND_COUNT] = {set.weight[BAND_24], set.weight[BAND_5]};
+    esp_err_t err = detector_set_config(&set.det);
+    if (err == ESP_OK) {
+        err = sweep_set_weights(w);
+    }
+    if (err == ESP_OK) {
+        detector_set_scan(set.scan);
+        err = sweep_set_scan(set.scan);
+    }
+    if (err == ESP_OK) {
+        err = settings_set(&set);
+    }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "remote: %s = %d", key, value);
+    }
+    return err;
+}
+#endif
+
 static void run(const char *line)
 {
     link_cmd_t cmd;
@@ -213,12 +318,34 @@ static void run(const char *line)
         atomic_store(&s_status_due, true);
         return;
     }
+    if (!strcmp(cmd.c, "autorange")) {
+        ESP_LOGI(TAG, "remote: auto-range gain");
+        sweep_autorange();
+        post_ack(cmd.id, NULL);
+        atomic_store(&s_status_due, true);
+        return;
+    }
+    if (!strcmp(cmd.c, "spec")) {
+        band_id_t band = BAND_24;
+        if (cmd.has_k && !strcmp(cmd.k, "5")) {
+            band = BAND_5;
+        } else if (cmd.has_v && cmd.v == 1) {
+            band = BAND_5;
+        }
+        const item_t it = {.kind = ITEM_SPEC, .band = band};
+        post(&it);
+        return;
+    }
     if (!strcmp(cmd.c, "set")) {
         if (!cmd.has_k || !cmd.has_v) {
             post_ack(cmd.id, "missing k or v");
             return;
         }
+#if CONFIG_JD_BOARD_C5_MINI_KIT
+        const esp_err_t err = apply_setting_headless(cmd.k, cmd.v);
+#else
         const esp_err_t err = ui_settings_set_key(cmd.k, cmd.v);
+#endif
         post_ack(cmd.id, err == ESP_OK ? NULL
                          : err == ESP_ERR_INVALID_ARG ? "bad key or value"
                          : err == ESP_ERR_TIMEOUT ? "busy"
