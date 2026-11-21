@@ -17,17 +17,24 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "sdkconfig.h"
 #include "audio.h"
 #include "board.h"
+#if CONFIG_JD_CHARACTERIZE
 #include "characterize.h"
+#endif
 #include "detector.h"
+#if !CONFIG_JD_BOARD_C5_MINI_KIT
 #include "eventlog.h"
+#include "lvgl_port.h"
+#include "ui.h"
+#else
+#include "status_led.h"
+#endif
 #include "link.h"
 #include "espsdr_rx.h"
-#include "lvgl_port.h"
 #include "settings.h"
 #include "sweep.h"
-#include "ui.h"
 
 static const char *TAG = "app";
 
@@ -74,7 +81,9 @@ static esp_err_t start(void)
     settings_get(&set);
 
     ESP_RETURN_ON_ERROR(board_init(BOARD_ORIENT_LANDSCAPE), TAG, "board");
+#if !CONFIG_JD_BOARD_C5_MINI_KIT
     ESP_RETURN_ON_ERROR(eventlog_start(), TAG, "event log");
+#endif
     esp_err_t aerr = audio_init();
     if (aerr != ESP_OK) {
         ESP_LOGW(TAG, "no alarm beep: %s", esp_err_to_name(aerr)); /* not fatal */
@@ -106,10 +115,15 @@ static esp_err_t start(void)
     ESP_RETURN_ON_ERROR(sweep_start(&cfg), TAG, "sweep");
     ESP_RETURN_ON_ERROR(detector_start(&set.det), TAG, "detector");
     detector_set_scan(set.scan);
+#if CONFIG_JD_BOARD_C5_MINI_KIT
+    ESP_RETURN_ON_ERROR(status_led_start(), TAG, "status_led");
+    ESP_RETURN_ON_ERROR(link_start(), TAG, "USB link");
+#else
     ESP_RETURN_ON_ERROR(lvp_init(), TAG, "lvgl");
     ESP_RETURN_ON_ERROR(ui_init(), TAG, "ui");
     ESP_RETURN_ON_ERROR(link_start(), TAG, "USB link");
     ESP_RETURN_ON_ERROR(board_backlight_set(set.brightness), TAG, "backlight");
+#endif
     return ESP_OK;
 }
 
