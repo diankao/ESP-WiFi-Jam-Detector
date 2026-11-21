@@ -72,6 +72,10 @@ const band_plan_t *sweep_plan(band_id_t band);
 
 /* Copy the latest stitched spectra; out->*_cdb must hold n_bins entries. */
 esp_err_t sweep_get_view(band_id_t band, sweep_view_t *out);
+/* Downsample the latest stitched spectra into n_pts buckets (avg = mean,
+ * max = peak per bucket, in 0.01 dB) with zero temporary heap allocation. */
+esp_err_t sweep_get_summary(band_id_t band, unsigned n_pts, int16_t *avg_cdb, int16_t *max_cdb,
+                            unsigned *gain, uint32_t *sweeps, bool *valid);
 void sweep_reset_maxhold(band_id_t band);
 /* Schedule weights, from the next round on (1..8 each). */
 esp_err_t sweep_set_weights(const unsigned weight[BAND_COUNT]);

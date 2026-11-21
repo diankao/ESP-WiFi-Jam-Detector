@@ -11,18 +11,31 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "sdkconfig.h"
 #include "detector.h"
+#if !CONFIG_JD_BOARD_C5_MINI_KIT
 #include "eventlog.h"
+#endif
 #include "link.h"
 #include "settings.h"
 #include "sweep.h"
+
+#if CONFIG_SPIRAM
+#define JD_BUF_CAPS MALLOC_CAP_SPIRAM
+#else
+#define JD_BUF_CAPS MALLOC_CAP_DEFAULT
+#endif
 
 static const char *TAG = "detect";
 
 #define TASK_PRIO       9 /* below the sweep (10): never delays a capture */
 #define TASK_STACK      4096
 #define STATUS_LOG_MS   10000
+#if CONFIG_SPIRAM
 #define SPECTRA         3 /* avg, min, max */
+#else
+#define SPECTRA         2 /* avg, min (detect.c does not read max_cdb) */
+#endif
 #define SAVE_PERIOD_MS  (60u * 60u * 1000u) /* keep the stored baseline close to the EMA-tracked one */
 
 typedef struct {
@@ -66,7 +79,9 @@ static void on_segment(const sweep_segment_t *seg, void *ctx)
     const size_t bytes = seg->bins * sizeof(int16_t);
     memcpy(b->spec[slot][0] + seg->first_bin, seg->avg_cdb, bytes);
     memcpy(b->spec[slot][1] + seg->first_bin, seg->min_cdb, bytes);
+#if SPECTRA > 2
     memcpy(b->spec[slot][2] + seg->first_bin, seg->max_cdb, bytes);
+#endif
     m->clipped += seg->clipped_snapshots;
     m->snapshots += seg->snapshots;
     m->slices++;
@@ -110,12 +125,28 @@ static void log_metrics(esp_log_level_t level, const char *band, const char *wha
 /* Detect task: the baseline only changes here, so no lock is needed to read it. */
 static void save_baseline(band_ctx_t *b, uint32_t t_ms)
 {
-    const size_t n = detect_save_baseline(&b->det, s_rec, s_rec_cap);
+    uint8_t *rec = s_rec;
+    bool temp = false;
+    if (!rec) {
+        rec = heap_caps_malloc(s_rec_cap, JD_BUF_CAPS);
+        if (!rec) {
+            ESP_LOGW(TAG, "%s baseline save: out of memory (%u B)", b->plan->name, (unsigned)s_rec_cap);
+            return;
+        }
+        temp = true;
+    }
+    const size_t n = detect_save_baseline(&b->det, rec, s_rec_cap);
     if (!n) {
+        if (temp) {
+            free(rec);
+        }
         return;
     }
     const int64_t t0 = esp_timer_get_time();
-    const esp_err_t err = settings_save_baseline(b->plan->id, s_rec, n);
+    const esp_err_t err = settings_save_baseline(b->plan->id, rec, n);
+    if (temp) {
+        free(rec);
+    }
     b->saved_ms = t_ms;
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "%s baseline saved (%u bytes, %u ms)", b->plan->name, (unsigned)n,
@@ -154,7 +185,11 @@ static void detector_task(void *arg)
         const detect_input_t in = {
             .avg_cdb = b->spec[slot][0],
             .min_cdb = b->spec[slot][1],
+#if SPECTRA > 2
             .max_cdb = b->spec[slot][2],
+#else
+            .max_cdb = NULL,
+#endif
             .clipped_snapshots = m->clipped,
             .snapshots = m->snapshots,
             .gain = m->gain,
@@ -171,7 +206,9 @@ static void detector_task(void *arg)
 
         const char *name = b->plan->name;
         if (changed) {
+#if !CONFIG_JD_BOARD_C5_MINI_KIT
             eventlog_post(b->plan->id, &ev);
+#endif
             link_post_event(b->plan->id, &ev);
             if (ev.from == DETECT_LEARNING && ev.to == DETECT_NORMAL) {
                 ESP_LOGI(TAG, "%s baseline learned (gain %u)", name, m->gain);
@@ -215,7 +252,7 @@ esp_err_t detector_start(const detect_config_t *cfg)
         b->plan = sweep_plan((band_id_t)i);
         ESP_RETURN_ON_FALSE(b->plan && b->plan->n_bins, ESP_ERR_INVALID_STATE, TAG, "sweep not started");
         const size_t bytes = detect_mem_bytes(b->plan);
-        void *mem = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+        void *mem = heap_caps_malloc(bytes, JD_BUF_CAPS);
         ESP_RETURN_ON_FALSE(mem, ESP_ERR_NO_MEM, TAG, "detector memory");
         ESP_RETURN_ON_FALSE(detect_init(&b->det, b->plan, cfg, mem, bytes) == 0, ESP_ERR_INVALID_ARG, TAG,
                             "detect init");
@@ -223,26 +260,31 @@ esp_err_t detector_start(const detect_config_t *cfg)
         s_rec_cap = rec > s_rec_cap ? rec : s_rec_cap;
         for (int s = 0; s < 2; s++) {
             for (int k = 0; k < SPECTRA; k++) {
-                b->spec[s][k] = heap_caps_calloc(b->plan->n_bins, sizeof(int16_t), MALLOC_CAP_SPIRAM);
+                b->spec[s][k] = heap_caps_calloc(b->plan->n_bins, sizeof(int16_t), JD_BUF_CAPS);
                 ESP_RETURN_ON_FALSE(b->spec[s][k], ESP_ERR_NO_MEM, TAG, "spectra");
             }
         }
         ESP_LOGI(TAG, "%s: %u cells of %u bins, %u KB working memory", b->plan->name, b->det.n_cells,
                  DETECT_CELL_BINS, (unsigned)(bytes / 1024));
     }
-    s_rec = heap_caps_malloc(s_rec_cap, MALLOC_CAP_SPIRAM);
-    ESP_RETURN_ON_FALSE(s_rec, ESP_ERR_NO_MEM, TAG, "baseline record");
+    uint8_t *boot_rec = heap_caps_malloc(s_rec_cap, JD_BUF_CAPS);
+    ESP_RETURN_ON_FALSE(boot_rec, ESP_ERR_NO_MEM, TAG, "baseline record");
     for (int i = 0; i < BAND_COUNT; i++) {
         band_ctx_t *b = &s_band[i];
         size_t len = 0;
-        esp_err_t err = settings_load_baseline((band_id_t)i, s_rec, s_rec_cap, &len);
-        if (err == ESP_OK && detect_load_baseline(&b->det, s_rec, len) == 0) {
+        esp_err_t err = settings_load_baseline((band_id_t)i, boot_rec, s_rec_cap, &len);
+        if (err == ESP_OK && detect_load_baseline(&b->det, boot_rec, len) == 0) {
             ESP_LOGI(TAG, "%s: stored baseline restored (re-learns if the gain differs)", b->plan->name);
         } else {
             ESP_LOGI(TAG, "%s: no usable stored baseline (%s), learning", b->plan->name,
                      err == ESP_OK ? "mismatch" : esp_err_to_name(err));
         }
     }
+#if CONFIG_SPIRAM
+    s_rec = boot_rec;
+#else
+    free(boot_rec); /* allocate on demand during save_baseline() to save ~10 KB internal SRAM */
+#endif
     ESP_LOGI(TAG, "learn %u s; wideband %.1f dB in %u%% of cells; narrowband %.1f dB in %u%% of sweeps; "
              "swept %.1f dB over %u%% of band; alarm after %u s at %u%% duty, clear after %u s",
              cfg->learn_s, cfg->wide_cdb / 100.0f, cfg->wide_pct, cfg->cw_cdb / 100.0f, cfg->cw_pct,
@@ -267,6 +309,37 @@ esp_err_t detector_get_baseline(band_id_t band, int16_t *out)
     ESP_RETURN_ON_FALSE(band < BAND_COUNT && out && s_lock, ESP_ERR_INVALID_ARG, TAG, "bad args");
     xSemaphoreTake(s_lock, portMAX_DELAY);
     detect_get_baseline(&s_band[band].det, out);
+    xSemaphoreGive(s_lock);
+    return ESP_OK;
+}
+
+esp_err_t detector_get_baseline_summary(band_id_t band, unsigned n_pts, int16_t *out, bool *ready)
+{
+    ESP_RETURN_ON_FALSE(band < BAND_COUNT && n_pts > 0 && out && s_lock, ESP_ERR_INVALID_ARG, TAG, "bad args");
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const detect_t *d = &s_band[band].det;
+    const bool ok = d->st.state != DETECT_LEARNING && d->n_bins > 0;
+    if (ready) {
+        *ready = ok;
+    }
+    if (ok) {
+        const unsigned n_bins = d->n_bins;
+        for (unsigned p = 0; p < n_pts; p++) {
+            const unsigned i0 = (p * n_bins) / n_pts;
+            unsigned i1 = ((p + 1u) * n_bins) / n_pts;
+            if (i1 <= i0) {
+                i1 = i0 + 1u;
+            }
+            if (i1 > n_bins) {
+                i1 = n_bins;
+            }
+            int32_t sum = 0;
+            for (unsigned i = i0; i < i1; i++) {
+                sum += (d->base_q8[i] >> 8);
+            }
+            out[p] = (int16_t)(sum / (int32_t)(i1 - i0));
+        }
+    }
     xSemaphoreGive(s_lock);
     return ESP_OK;
 }

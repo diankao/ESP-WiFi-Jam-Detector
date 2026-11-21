@@ -17,6 +17,8 @@ esp_err_t detector_start(const detect_config_t *cfg);
 esp_err_t detector_get_status(band_id_t band, detect_status_t *out);
 /* Per-bin baseline (cdB); out needs the band's n_bins entries. */
 esp_err_t detector_get_baseline(band_id_t band, int16_t *out);
+/* Downsampled baseline (cdB) into n_pts buckets; zero heap allocation. */
+esp_err_t detector_get_baseline_summary(band_id_t band, unsigned n_pts, int16_t *out, bool *ready);
 /* New thresholds for both bands; baselines are kept. */
 esp_err_t detector_set_config(const detect_config_t *cfg);
 /* Bands being swept. A band turned off or on again drops its evidence and

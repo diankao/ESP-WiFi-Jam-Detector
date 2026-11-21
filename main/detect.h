@@ -36,9 +36,21 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "bandplan.h"
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#endif
 
+#if defined(CONFIG_JD_BOARD_C5_MINI_KIT) && !defined(CONFIG_SPIRAM)
+#define DETECT_CELL_BINS 16 /* 10 MHz detection cells at 625 kHz (decim=8) */
+#ifndef DETECT_LEARN_MAX
+#define DETECT_LEARN_MAX 6  /* compact baseline buffer for no-PSRAM internal SRAM */
+#endif
+#else
 #define DETECT_CELL_BINS 32 /* 10 MHz detection cells at 312.5 kHz; the last cell takes the remainder */
+#ifndef DETECT_LEARN_MAX
 #define DETECT_LEARN_MAX 32 /* baseline samples kept per bin (decimated over the learning time) */
+#endif
+#endif
 #define DETECT_HIST      32 /* sweeps of per-bin / per-cell history */
 
 typedef enum {

@@ -82,7 +82,11 @@ static int16_t *s_seg_avg, *s_seg_max, *s_seg_min;
 
 static void *psram_alloc(size_t bytes)
 {
+#if CONFIG_SPIRAM
     return heap_caps_calloc(1, bytes, MALLOC_CAP_SPIRAM);
+#else
+    return heap_caps_calloc(1, bytes, MALLOC_CAP_DEFAULT);
+#endif
 }
 
 /* One capture inside the radio-quiet window (no LCD DMA while sampling).
@@ -188,9 +192,11 @@ static esp_err_t sweep_slice(band_state_t *b, unsigned s, bool last)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     memcpy(b->avg_cdb + first, s_seg_avg, bins * sizeof(int16_t));
     memcpy(b->max_cdb + first, s_seg_max, bins * sizeof(int16_t));
-    for (unsigned k = 0; k < bins; k++) {
-        if (s_seg_max[k] > b->hold_cdb[first + k]) {
-            b->hold_cdb[first + k] = s_seg_max[k];
+    if (b->hold_cdb) {
+        for (unsigned k = 0; k < bins; k++) {
+            if (s_seg_max[k] > b->hold_cdb[first + k]) {
+                b->hold_cdb[first + k] = s_seg_max[k];
+            }
         }
     }
     b->clipped_acc += clipped_snaps;
@@ -257,7 +263,9 @@ static esp_err_t autorange(bool all)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_band[i].gain = gain[i] = g;
         s_band[i].valid = false; /* the view restarts at the new gain */
-        memset(s_band[i].hold_cdb, 0, s_band[i].plan.n_bins * sizeof(int16_t));
+        if (s_band[i].hold_cdb) {
+            memset(s_band[i].hold_cdb, 0, s_band[i].plan.n_bins * sizeof(int16_t));
+        }
         xSemaphoreGive(s_lock);
     }
     s_state = SWEEP_RUNNING;
@@ -325,17 +333,33 @@ esp_err_t sweep_start(const sweep_config_t *cfg)
     s_lock = xSemaphoreCreateMutex();
     ESP_RETURN_ON_FALSE(s_lock, ESP_ERR_NO_MEM, TAG, "lock");
 
+#if defined(CONFIG_JD_BOARD_C5_MINI_KIT) && !defined(CONFIG_SPIRAM)
+    const unsigned decim = 8; /* 625 kHz grid bin width: halves 5 GHz RAM for no-PSRAM */
+#else
+    const unsigned decim = 4; /* 312.5 kHz grid bin width */
+#endif
     const bp_config_t bp = {
-        .rate_hz = rx_rate_hz(cfg->rate), .fft_n = FFT_N, .usable_hz = cfg->usable_hz, .decim = 4,
+        .rate_hz = rx_rate_hz(cfg->rate), .fft_n = FFT_N, .usable_hz = cfg->usable_hz, .decim = decim,
     };
+    unsigned max_slice_bins = 0;
     for (int i = 0; i < BAND_COUNT; i++) {
         band_state_t *b = &s_band[i];
         ESP_RETURN_ON_FALSE(bp_build(&b->plan, (band_id_t)i, &bp) == 0, ESP_ERR_INVALID_ARG, TAG,
                             "band plan %d does not fit", i);
+        for (unsigned s = 0; s < b->plan.n_slices; s++) {
+            if (b->plan.slice_bins[s] > max_slice_bins) {
+                max_slice_bins = b->plan.slice_bins[s];
+            }
+        }
         b->avg_cdb = psram_alloc(b->plan.n_bins * sizeof(int16_t));
         b->max_cdb = psram_alloc(b->plan.n_bins * sizeof(int16_t));
+#if CONFIG_JD_BOARD_C5_MINI_KIT
+        b->hold_cdb = NULL; /* unused on headless board */
+        ESP_RETURN_ON_FALSE(b->avg_cdb && b->max_cdb, ESP_ERR_NO_MEM, TAG, "band buffers");
+#else
         b->hold_cdb = psram_alloc(b->plan.n_bins * sizeof(int16_t));
         ESP_RETURN_ON_FALSE(b->avg_cdb && b->max_cdb && b->hold_cdb, ESP_ERR_NO_MEM, TAG, "band buffers");
+#endif
         ESP_LOGI(TAG, "%s plan: %u slices of %" PRIu32 " MHz (centres %u..%u MHz), %u bins of %" PRIu32 " Hz",
                  b->plan.name, b->plan.n_slices, cfg->usable_hz / 1000000, b->plan.center_mhz[0],
                  b->plan.center_mhz[b->plan.n_slices - 1], b->plan.n_bins, b->plan.res_hz);
@@ -347,13 +371,13 @@ esp_err_t sweep_start(const sweep_config_t *cfg)
     uint16_t *order = psram_alloc(FFT_N * sizeof(uint16_t));
     s_iq = psram_alloc(2 * FFT_N * sizeof(int16_t));
     s_power = psram_alloc(FFT_N * sizeof(uint32_t));
-    s_avg = psram_alloc(FFT_N * sizeof(uint32_t));
+    s_avg = s_power; /* s_power is no longer needed once snapshots are accumulated into s_sum */
     s_max = psram_alloc(FFT_N * sizeof(uint32_t));
     s_sum = psram_alloc(FFT_N * sizeof(uint64_t));
-    s_seg_avg = psram_alloc(BP_MAX_BINS * sizeof(int16_t));
-    s_seg_max = psram_alloc(BP_MAX_BINS * sizeof(int16_t));
-    s_seg_min = psram_alloc(BP_MAX_BINS * sizeof(int16_t));
-    s_gmin = psram_alloc(BP_MAX_BINS * sizeof(uint32_t));
+    s_seg_avg = psram_alloc(max_slice_bins * sizeof(int16_t));
+    s_seg_max = psram_alloc(max_slice_bins * sizeof(int16_t));
+    s_seg_min = psram_alloc(max_slice_bins * sizeof(int16_t));
+    s_gmin = psram_alloc(max_slice_bins * sizeof(uint32_t));
     ESP_RETURN_ON_FALSE(window && twiddle && work && order && s_iq && s_power && s_avg && s_max && s_sum &&
                             s_seg_avg && s_seg_max && s_seg_min && s_gmin,
                         ESP_ERR_NO_MEM, TAG, "DSP buffers");
@@ -389,7 +413,7 @@ esp_err_t sweep_get_view(band_id_t band, sweep_view_t *out)
     if (out->max_cdb) {
         memcpy(out->max_cdb, b->max_cdb, bytes);
     }
-    if (out->hold_cdb) {
+    if (out->hold_cdb && b->hold_cdb) {
         memcpy(out->hold_cdb, b->hold_cdb, bytes);
     }
     out->sweeps = b->sweeps;
@@ -403,15 +427,60 @@ esp_err_t sweep_get_view(band_id_t band, sweep_view_t *out)
     return ESP_OK;
 }
 
+esp_err_t sweep_get_summary(band_id_t band, unsigned n_pts, int16_t *avg_cdb, int16_t *max_cdb,
+                            unsigned *gain, uint32_t *sweeps, bool *valid)
+{
+    ESP_RETURN_ON_FALSE(band < BAND_COUNT && n_pts > 0 && avg_cdb && max_cdb, ESP_ERR_INVALID_ARG, TAG, "bad summary args");
+    const band_state_t *b = &s_band[band];
+    const unsigned n_bins = b->plan.n_bins;
+    ESP_RETURN_ON_FALSE(n_bins > 0, ESP_ERR_INVALID_STATE, TAG, "no plan");
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (gain) {
+        *gain = b->gain;
+    }
+    if (sweeps) {
+        *sweeps = b->sweeps;
+    }
+    if (valid) {
+        *valid = b->valid;
+    }
+    if (b->valid) {
+        for (unsigned p = 0; p < n_pts; p++) {
+            const unsigned i0 = (p * n_bins) / n_pts;
+            unsigned i1 = ((p + 1u) * n_bins) / n_pts;
+            if (i1 <= i0) {
+                i1 = i0 + 1u;
+            }
+            if (i1 > n_bins) {
+                i1 = n_bins;
+            }
+            int32_t sum = 0;
+            int16_t mx = b->max_cdb[i0];
+            for (unsigned i = i0; i < i1; i++) {
+                sum += b->avg_cdb[i];
+                if (b->max_cdb[i] > mx) {
+                    mx = b->max_cdb[i];
+                }
+            }
+            avg_cdb[p] = (int16_t)(sum / (int32_t)(i1 - i0));
+            max_cdb[p] = mx;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    return ESP_OK;
+}
+
 void sweep_reset_maxhold(band_id_t band)
 {
     if (band >= BAND_COUNT) {
         return;
     }
     band_state_t *b = &s_band[band];
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    memcpy(b->hold_cdb, b->max_cdb, b->plan.n_bins * sizeof(int16_t));
-    xSemaphoreGive(s_lock);
+    if (b->hold_cdb) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        memcpy(b->hold_cdb, b->max_cdb, b->plan.n_bins * sizeof(int16_t));
+        xSemaphoreGive(s_lock);
+    }
 }
 
 esp_err_t sweep_set_weights(const unsigned weight[BAND_COUNT])
