@@ -1,0 +1,7 @@
+# Name,   Type, SubType, Offset,   Size, Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x280000,
+# Settings, auto-range gains and learned baselines (main/settings.c): a 5 GHz
+# baseline is ~10 KB, kept in its own NVS partition within the 4 MB flash.
+jd_nvs,   data, nvs,     0x290000, 256K,

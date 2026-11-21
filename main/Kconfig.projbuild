@@ -1,5 +1,45 @@
 menu "esp-wifi-jammer-detector"
 
+    choice JD_BOARD
+        prompt "Target development board"
+        default JD_BOARD_TOUCH_LCD_3_5
+        help
+            Select the hardware target. Use sdkconfig.defaults for the
+            Waveshare ESP32-C5-Touch-LCD-3.5 (LCD + PSRAM + 32 MB flash), or
+            sdkconfig.defaults.c5_mini_kit for the Waveshare ESP32-C5-MINI-KIT-U
+            (headless, onboard WS2812B RGB LED, no PSRAM, 4 MB flash).
+
+        config JD_BOARD_TOUCH_LCD_3_5
+            bool "Waveshare ESP32-C5-Touch-LCD-3.5 (LCD + PSRAM)"
+
+        config JD_BOARD_C5_MINI_KIT
+            bool "Waveshare ESP32-C5-MINI-KIT-U (Headless + RGB LED)"
+    endchoice
+
+    config JD_RGB_LED_GPIO
+        int "Onboard WS2812B RGB LED GPIO (-1 to disable)"
+        depends on JD_BOARD_C5_MINI_KIT
+        range -1 28
+        default 27
+        help
+            GPIO connected to the onboard addressable WS2812B RGB LED.
+            On Waveshare ESP32-C5-MINI-KIT-U this is GPIO 27.
+
+    config JD_BUZZER_GPIO
+        int "External passive buzzer PWM GPIO (-1 to disable)"
+        depends on JD_BOARD_C5_MINI_KIT
+        range -1 28
+        default 4
+        help
+            GPIO for an optional passive piezo buzzer driven by the hardware
+            LEDC PWM peripheral (zero CPU/DMA overhead). Set to -1 to disable.
+
+    config JD_BUZZER_FREQ_HZ
+        int "Passive buzzer tone frequency (Hz)"
+        depends on JD_BOARD_C5_MINI_KIT
+        range 500 8000
+        default 2000
+
     config JD_CHARACTERIZE
         bool "Run receiver characterisation at boot"
         default n
