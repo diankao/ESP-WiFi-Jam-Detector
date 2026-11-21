@@ -1,8 +1,10 @@
 build/
 build-*/
+build_c5_mini/
 sdkconfig
 sdkconfig.old
 managed_components/
 __pycache__/
+.venv/
 # full-size originals of the README media (docs/media holds the optimised copies)
 photos/
