@@ -68,7 +68,8 @@ const char *link_band_name(band_id_t b)
     return b == BAND_24 ? "2.4" : "5";
 }
 
-size_t link_fmt_hello(char *buf, size_t cap, const char *id, const char *fw, const char *model)
+size_t link_fmt_hello(char *buf, size_t cap, const char *id, const char *fw, const char *model,
+                      const link_ota_info_t *ota)
 {
     jw_t w = {.buf = buf, .cap = cap};
     jw(&w, "{\"t\":\"hello\",\"v\":%d,\"id\":\"%s\",\"fw\":\"%s\",\"model\":\"%s\",\"bands\":[\"2.4\",\"5\"],",
@@ -80,6 +81,9 @@ size_t link_fmt_hello(char *buf, size_t cap, const char *id, const char *fw, con
            i->name, i->unit, i->min, i->max, i->step);
     }
     jw(&w, "]");
+    if (ota) {
+        jw(&w, ",\"ota\":{\"slot\":\"%s\",\"img\":\"%s\"}", ota->slot, ota->img);
+    }
     return jw_end(&w);
 }
 
@@ -143,6 +147,21 @@ size_t link_fmt_ack(char *buf, size_t cap, int id, const char *err)
     jw(&w, "{\"t\":\"ack\",\"v\":%d,\"id\":%d,\"ok\":%s", LINK_PROTO_VERSION, id, tf(!err));
     if (err) {
         jw(&w, ",\"err\":\"%s\"", err);
+    }
+    return jw_end(&w);
+}
+
+size_t link_fmt_oack(char *buf, size_t cap, const link_oack_t *o)
+{
+    jw_t w = {.buf = buf, .cap = cap};
+    jw(&w, "{\"t\":\"oack\",\"v\":%d,\"id\":%d,\"ok\":%s", LINK_PROTO_VERSION, o->id, tf(o->ok));
+    if (o->err) {
+        jw(&w, ",\"err\":\"%s\"", o->err);
+    } else {
+        jw(&w, ",\"seq\":%u,\"bytes\":%u", (unsigned)o->seq, (unsigned)o->bytes);
+        if (o->done) {
+            jw(&w, ",\"done\":true,\"slot\":\"%s\"", o->slot);
+        }
     }
     return jw_end(&w);
 }
@@ -219,7 +238,8 @@ int link_parse(const char *line, link_cmd_t *out)
         } else if (*p == '-' || isdigit((unsigned char)*p)) {
             char *end;
             ival = strtol(p, &end, 10);
-            if (end == p || *end == '.' || *end == 'e' || *end == 'E' || ival < -1000000 || ival > 1000000) {
+            if (end == p || *end == '.' || *end == 'e' || *end == 'E' || ival < -LINK_INT_MAX ||
+                ival > LINK_INT_MAX) {
                 return -1;
             }
             p = end;

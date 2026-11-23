@@ -115,9 +115,43 @@ ESP32-C5 内部共有 384 KB SRAM，其中 `sram_guard.ld` 锁定了 `0x40820000
 ### 阶段 0~4 已落地改动清单
 - **阶段 0（硬件排雷）**：实测 `esp-sdr` 锁定的 ESP-IDF 6.2 快照在 ESP32-C5 上官方 `rmt_tx` 会触发 `flush timeout`；改用 **240 MHz RISC-V 周期计数器 (`esp_cpu_get_cycle_count`) 纯 GPIO27 精确时序直驱 WS2812B**（单次刷新仅 ~30 µs，且包裹在 `board_rf_quiet_begin/end` 静默窗内，实机点亮变色验证通过）。
 - **阶段 1（双板配置与 4MB 分区）**：新增 `partitions_4mb.csv`、`sdkconfig.defaults.c5_mini_kit`，在 `main/Kconfig.projbuild` 新增双板选择宏 `CONFIG_JD_BOARD_C5_MINI_KIT` 及 RGB/蜂鸣器引脚配置。
-- **阶段 2（无屏 BSP + RGB + 硬件 PWM 蜂鸣器）**：新增 `components/board/board_c5_mini.c`（轻量射频静默互斥锁）、`main/status_led.c`（5 状态灯效 + 报警触发）、`main/audio.c`（硬件 LEDC PWM 蜂鸣器后端）。
-- **阶段 3（无 PSRAM 双频内存适配）**：`main/detect.h` 在无 PSRAM 模式下自动设定 `DETECT_LEARN_MAX = 8`；`main/sweep.c` 与 `main/detector.c` 自动回退 `MALLOC_CAP_DEFAULT`，并将 ~10 KB 基线保存缓冲改为按需分配/释放。
+- **阶段 2（无屏 BSP + RGB + 硬件 PWM 蜂鸣器）**：新增 `components/board/board_c5_mini.c`（轻量射频静默互斥锁）、`main/status_led.c`（6 状态灯效：`AUTORANGE`/`LEARNING`/`NORMAL`/`SUSPECT`/`ALARM`/`FAILED` + 报警蜂鸣触发）、`main/audio.c`（硬件 LEDC PWM 蜂鸣器后端）。
+- **阶段 3（无 PSRAM 双频内存适配）**：`main/detect.h` 在无 PSRAM 模式下自动设定 `DETECT_CELL_BINS = 16`（625 kHz 网格 × 16 = 10 MHz 等效单元）、`DETECT_LEARN_MAX = 6`；`main/sweep.c` 与 `main/detector.c` 自动回退 `MALLOC_CAP_DEFAULT`，并将 ~10 KB 基线保存缓冲改为按需分配/释放。
 - **阶段 4（主程序解耦 + 串口频谱流 + PC 上位机）**：`main/app_main.c` 跳过 LVGL/TF 卡并启动 `status_led`；`main/link.c` 解耦远程 `set`、新增 `autorange` 与零堆开销 `spec`（100 点下采样频谱）指令；新增电脑端实时频谱/瀑布图上位机 `tools/pc_viewer.py`。
+- **真机实测日志（COM5，ESP32-C5HF4 v1.2，4 MB Flash，0 PSRAM）**：
+  - `headroom below capture guard 22760 B; internal heap free 8320 (largest 7680, min ever 8320), PSRAM free 0`
+  - `2.4 GHz`: 2 slices (134 bins @ 625 kHz), 35 ms/sweep (2.66 sweeps/s), auto-range gain 41
+  - `5 GHz`: 16 slices (1192 bins @ 625 kHz), 676 ms/sweep (1.33 sweeps/s), auto-range gain 79
+
+### 阶段 6：串口 OTA + A/B 双分区 + Bootloader 掉电安全回滚
+
+> 无屏设备唯一固件分发通道就是 USB 串口。本阶段把"升级"做成一个在任何
+> Unhappy Path（拔线 / 坏帧 / 断电 / 坏固件）下都**不变砖**的闭环。
+
+**固件侧（`main/ota_upgrade.c`，协议详见 `docs/LINK.md`）**
+* **分区表重排（`partitions_4mb.csv`）**：`ota_0` @0x10000 与 `ota_1` @0x150000 各 1280 KB（现 app 仅 831 KB），`otadata` 8 KB；**`jd_nvs` 钉在原偏移 0x290000，已学基线零丢失迁移**，且旧 factory 就在 0x10000——存量设备只需刷入新分区表，原 app 无缝变为 ota_0 继续运行。
+* **传输 = JSON 控制面 + 二进制帧数据面**：`ota_begin(v=镜像字节数)` 后链路切换为 `[u32 seq][u32 len][u32 crc32][payload≤448B]` 小端二进制帧，**严格停等**（460 B 帧 ≤ 链路 512 B RX 环形缓冲；`esp_ota_begin` 预擦除期间 CPU 冻结数秒，begin 的 ack 在擦除后才发出，上位机等 60 s）。逐帧 CRC32（zlib 兼容），终验交给 `esp_ota_end` 的镜像 SHA-256——传输层只抓误码，完整性是 bootloader 级的。
+* **安全态门禁**：任一频段处于 `ALARM`（等价医疗场景"正在刺激/采集中"）时 `ota_begin` 直接拒绝（`active alarm`），报警状态机绝不被升级打断。
+* **回滚（bootloader 裁决）**：`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`；新固件以 `PENDING_VERIFY` 启动，`ota_boot_check()` 起 10 s 自检任务，`sweep_state()==SWEEP_RUNNING` 才调 `esp_ota_mark_app_valid_cancel_rollback()`（或上位机 `ota_confirm` 立即转正）。**坏固件崩溃/挂死 → 无人转正 → 下次复位 bootloader 自动回滚旧槽并标坏槽 INVALID**。
+* **扫频联动**：升级期间 `sweep_pause(true)` 段间停车，abort/done 后恢复或随重启结束；帧间 5 s 静默自动 abort。LCD 板（factory-only）代码可编译、运行期 no-op。
+
+**上位机（`tools/pc_upgrader.py`）**
+按 `docs/LINK.md` 的 DTR/RTS 组合开端口避免误复位；ping 同步丢弃陈旧缓冲行；停等发帧 + 每帧 3 次重试 + 进度/ETA；`done` 后等设备重启、自动回连 `hello` 验证新版本与槽位并发送 `ota_confirm`；`--corrupt-at N` 支持单帧坏字节故障注入。
+
+**真机验收清单（Unhappy Path 逐项过）**
+1. 只刷新分区表 → 旧 app 变 ota_0 正常跑、基线保留（看 `hello` 的 `ota.img`）。
+2. `pc_upgrader.py` 完整升级 → ota_1 `pending` → confirm/自检 → `valid`；再升回 ota_0，A/B 交替。
+3. `--corrupt-at 50`：第 50 帧被 CRC 拦截，设备回 `oack err=crc` 并中止，扫频与 RGB 灯效恢复。
+4. 升级到 50% 直接拔 USB：5 s 静默超时自动 abort，设备继续正常检测。
+5. 升级写 flash 中途拔电源：重上电仍从旧槽启动（otadata 未切换）。
+6. 人为刷"开机即死"固件且不复位不复位：下次复位 bootloader 回滚旧槽。
+
+**面试考点速记（每条都能对着代码讲）**
+* 为什么回滚必须由 bootloader 完成、otadata 如何原子切换（双 sector 轮换写）。
+* 为什么停等而非滑动窗口：单核 CPU 在 flash 写/擦时冻结，环形缓冲仅 512 B。
+* 升级中断电的三种时刻（擦除中/写帧中/otadata 切换后）分别发生什么。
+* 安全态门禁为什么放在设备端而不是上位机侧。
+* 扩展点（已留文档未启用）：Secure Boot V2 签名链；`CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK` + eFuse `security_version` 防降级——**eFuse 不可逆，hobby 板默认不烧**。
 
 ### 快速编译与烧录（PowerShell）
 ```powershell

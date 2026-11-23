@@ -8,6 +8,7 @@ set(MAIN_SRCS
     "dsp.c"
     "link.c"
     "link_proto.c"
+    "ota_upgrade.c"
     "params.c"
     "settings.c"
     "settings_values.c"
@@ -15,6 +16,7 @@ set(MAIN_SRCS
 )
 
 set(MAIN_PRIV_REQS
+    app_update
     board
     esp_app_format
     esp_driver_gpio
@@ -25,6 +27,7 @@ set(MAIN_PRIV_REQS
     esp_timer
     heap
     nvs_flash
+    spi_flash
 )
 
 if(CONFIG_JD_BOARD_C5_MINI_KIT)

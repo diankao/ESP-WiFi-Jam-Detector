@@ -11,6 +11,12 @@ CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
 
+# Serial OTA (tools/pc_upgrader.py): an upgraded app boots as PENDING_VERIFY
+# and must call esp_ota_mark_app_valid_cancel_rollback() (main/ota_upgrade.c
+# does so after a 10 s self-check, or on the ota_confirm command). If it never
+# does, the bootloader re-boots the previous ota slot on the next reset.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
 # Console & RTOS: same base settings as esp-sdr's sdkconfig.defaults.esp32c5.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y

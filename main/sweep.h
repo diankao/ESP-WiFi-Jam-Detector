@@ -85,6 +85,10 @@ esp_err_t sweep_set_scan(const bool scan[BAND_COUNT]);
 bool sweep_scanned(band_id_t band);
 /* Auto-range both bands again after the current sweep. */
 void sweep_autorange(void);
+/* Park the task between whole sweeps (serial OTA: flash writes must not
+ * overlap captures). Takes effect when the running sweep finishes; a band
+ * sweep is a few hundred ms. */
+void sweep_pause(bool pause);
 
 /* Called from the sweep task after every tune. Keep it short; copy and queue. */
 void sweep_set_segment_cb(sweep_segment_cb_t cb, void *ctx);

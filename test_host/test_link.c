@@ -33,6 +33,9 @@ static void test_parse(void)
     CHECK(link_parse("{\"c\":\"set\",\"k\":\"beep\",\"v\":true}", &c) == 0 && c.v == 1, "true");
     CHECK(link_parse("{\"c\":\"set\",\"k\":\"beep\",\"v\":false}", &c) == 0 && c.v == 0 && c.has_v, "false");
     CHECK(link_parse("{\"c\":\"set\",\"v\":-3,\"k\":\"x\"}", &c) == 0 && c.v == -3, "negative");
+    CHECK(link_parse("{\"c\":\"ota_begin\",\"v\":831200,\"id\":7}", &c) == 0 && c.has_v && c.v == 831200 &&
+              c.id == 7,
+          "ota image size fits the widened range");
     CHECK(link_parse("{\"c\":\"get\",\"future\":\"x\",\"n\":5}", &c) == 0 && !strcmp(c.c, "get"), "unknown keys");
 
     static const char *const bad[] = {
@@ -46,7 +49,8 @@ static void test_parse(void)
         "{\"c\":\"set\",\"v\":null}",
         "{\"c\":\"set\",\"v\":[1]}",
         "{\"c\":\"set\",\"v\":{\"a\":1}}",
-        "{\"c\":\"set\",\"v\":99999999}",         /* out of range */
+        "{\"c\":\"set\",\"v\":4000001}",          /* out of range (new cap) */
+        "{\"c\":\"set\",\"v\":99999999}",         /* far out of range */
         "{\"c\":\"he\\\"llo\"}",                  /* escapes not accepted */
         "{\"c\":\"hello\"",                        /* unterminated */
         "{\"c\":\"hello\"} x",                     /* trailing junk */
@@ -96,10 +100,16 @@ static void test_params(void)
 static void test_format(FILE *out)
 {
     static char buf[LINK_LINE_MAX];
-    size_t n = link_fmt_hello(buf, sizeof(buf), "aabbccddeeff", "1.1.0", "ESP32-C5-Touch-LCD-3.5");
-    CHECK(n > 0 && n == strlen(buf) && buf[n - 1] == '\n' && !strncmp(buf, "{\"t\":\"hello\"", 12), "hello");
+    size_t n = link_fmt_hello(buf, sizeof(buf), "aabbccddeeff", "1.1.0", "ESP32-C5-Touch-LCD-3.5", NULL);
+    CHECK(n > 0 && n == strlen(buf) && buf[n - 1] == '\n' && !strncmp(buf, "{\"t\":\"hello\"", 12) &&
+              !strstr(buf, "\"ota\""),
+          "hello without ota info");
     fputs(buf, out);
     printf("hello: %zu bytes\n", n);
+    link_ota_info_t ota = {.slot = "ota_1", .img = "pending"};
+    n = link_fmt_hello(buf, sizeof(buf), "aabbccddeeff", "1.1.0", "ESP32-C5-Touch-LCD-3.5", &ota);
+    CHECK(n > 0 && strstr(buf, "\"ota\":{\"slot\":\"ota_1\",\"img\":\"pending\"}"), "hello with ota info");
+    fputs(buf, out);
 
     link_status_t s;
     memset(&s, 0, sizeof(s));
@@ -154,8 +164,25 @@ static void test_format(FILE *out)
     CHECK(n > 0 && strstr(buf, "\"ok\":false,\"err\":\"bad key or value\"}"), "ack err: %s", buf);
     fputs(buf, out);
 
+    link_oack_t oack = {.ok = true, .id = 9, .seq = 41, .bytes = 18368};
+    n = link_fmt_oack(buf, sizeof(buf), &oack);
+    CHECK(n > 0 && strstr(buf, "\"t\":\"oack\"") && strstr(buf, "\"id\":9,\"ok\":true,\"seq\":41,\"bytes\":18368}") &&
+              !strstr(buf, "\"done\""),
+          "oack frame: %s", buf);
+    fputs(buf, out);
+    oack = (link_oack_t){.ok = true, .id = 9, .seq = 1856, .bytes = 831200, .done = true};
+    snprintf(oack.slot, sizeof(oack.slot), "ota_1");
+    n = link_fmt_oack(buf, sizeof(buf), &oack);
+    CHECK(n > 0 && strstr(buf, "\"done\":true,\"slot\":\"ota_1\"}"), "oack done: %s", buf);
+    fputs(buf, out);
+    oack = (link_oack_t){.ok = false, .id = 9, .err = "crc"};
+    n = link_fmt_oack(buf, sizeof(buf), &oack);
+    CHECK(n > 0 && strstr(buf, "\"ok\":false,\"err\":\"crc\"}") && !strstr(buf, "\"seq\""), "oack err: %s", buf);
+    fputs(buf, out);
+
     char tiny[40];
-    CHECK(link_fmt_hello(tiny, sizeof(tiny), "aabbccddeeff", "1.1.0", "x") == 0 && tiny[0] == '\0', "overflow");
+    CHECK(link_fmt_hello(tiny, sizeof(tiny), "aabbccddeeff", "1.1.0", "x", NULL) == 0 && tiny[0] == '\0',
+          "overflow");
 }
 
 int main(int argc, char **argv)

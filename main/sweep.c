@@ -69,6 +69,7 @@ static band_state_t s_band[BAND_COUNT];
 static SemaphoreHandle_t s_lock;
 static volatile sweep_state_t s_state = SWEEP_IDLE;
 static volatile bool s_autorange;
+static volatile bool s_pause;
 static sweep_segment_cb_t s_seg_cb;
 static void *s_seg_ctx;
 
@@ -282,6 +283,9 @@ static void sweep_task(void *arg)
     while (err == ESP_OK) {
         for (int i = 0; i < BAND_COUNT && err == ESP_OK; i++) {
             for (unsigned w = 0; s_cfg.scan[i] && w < s_cfg.weight[i] && err == ESP_OK && !s_autorange; w++) {
+                while (s_pause && !s_autorange) { /* parked between sweeps (serial OTA) */
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                }
                 err = sweep_band(&s_band[i]);
             }
         }
@@ -514,6 +518,11 @@ bool sweep_scanned(band_id_t band)
 void sweep_autorange(void)
 {
     s_autorange = true;
+}
+
+void sweep_pause(bool pause)
+{
+    s_pause = pause;
 }
 
 void sweep_set_segment_cb(sweep_segment_cb_t cb, void *ctx)

@@ -1,14 +1,16 @@
-# `tools/` — 合成射频频谱仿真生成器
+# `tools/` — 仿真数据生成器与上位机工具
 
 [⬅ 返回根目录文档](../README_CN.md)
 
-本目录包含 `sim_spectra.py`，用于在**不发射任何真实无线电干扰信号**的前提下，按照 ESP32-C5 真实的扫频时序物理模型生成测试频谱数据，驱动 [`../test_host/test_detect.c`](../test_host/README.md) 验证检测器算法。
+本目录包含 `sim_spectra.py`（合成频谱仿真）与 `pc_viewer.py` / `pc_upgrader.py`（USB 串口上位机）。
 
 ---
 
 ## 📂 文件说明
 
 * **`sim_spectra.py`**：纯 Python 3 标准库编写（零外部依赖）。
+* **`pc_viewer.py`**：实时频谱 / 瀑布图上位机（`pip install pyserial numpy matplotlib`），用法见其文件头注释。
+* **`pc_upgrader.py`**：串口固件升级上位机（OTA A/B 双分区 + 回滚，协议见 [`../docs/LINK.md`](../docs/LINK.md)）。
 
 ### 仿真物理模型细节
 为了确保仿真数据与真机高度一致，`sim_spectra.py` 精确复刻了真机的采样时间窗：
@@ -40,3 +42,27 @@ python3 tools/sim_spectra.py --out /tmp/sim --seed 42 --only microwave swept
 每个 `.bin` 文件以 8 字节魔数 `b"JDSIM2\0\0"` + `uint32` 记录总数开头，随后每条扫频记录包含：
 * 频段 ID (`0=2.4G`, `1=5G`)、`n_bins`、扫频起止毫秒时间戳 `t_start_ms` / `t_ms`、增益档位、削波快照数、总快照数。
 * 紧跟三个长度为 `n_bins` 的 `int16` 数组：`avg_cdb`、`min_cdb`、`max_cdb`（单位 `0.01 dB`）。
+
+---
+
+## ▶️ 串口固件升级（`pc_upgrader.py`）
+
+把 A/B 分区固件（`sdkconfig.defaults.c5_mini_kit` 构建）经 USB Serial/JTAG 推进设备：
+停等二进制帧 + CRC32 逐帧校验，设备端 `esp_ota_end` 做镜像 SHA-256 终验，
+新固件以 PENDING_VERIFY 启动，10 秒自检（或 `ota_confirm`）后转正，否则 bootloader 回滚旧槽。
+
+```bash
+pip install pyserial
+
+# 自动探测端口，升级最近一次 build_c5_mini 的产物，重启后自动回连验证并 confirm
+python tools/pc_upgrader.py
+
+# 指定端口与镜像
+python tools/pc_upgrader.py --port COM5 --bin build-c5-mini/esp-wifi-jammer-detector.bin
+
+# 故障注入测试：第 50 帧故意翻转 1 字节，设备应回 oack err=crc 并中止升级
+python tools/pc_upgrader.py --corrupt-at 50
+```
+
+升级前置条件与失败行为（`active alarm` 门禁、拔线 5 秒自动中止、断电保持旧固件运行等）
+详见 [`../docs/LINK.md`](../docs/LINK.md) 的 "Serial OTA upgrade" 一节。

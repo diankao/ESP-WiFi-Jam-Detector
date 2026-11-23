@@ -1,7 +1,16 @@
 # Name,   Type, SubType, Offset,   Size, Flags
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
-factory,  app,  factory, 0x10000,  0x280000,
+# A/B app slots for the serial OTA upgrade (tools/pc_upgrader.py + main/ota_upgrade.c).
+# The old single factory partition sat at 0x10000 too, so an already-deployed
+# device only needs this new table flashed to become ota_0 -- its app keeps
+# running; jd_nvs keeps its offset, so the learned baselines survive as well.
+ota_0,    app, ota_0,   0x10000,  0x140000,
+ota_1,    app, ota_1,   0x150000, 0x140000,
 # Settings, auto-range gains and learned baselines (main/settings.c): a 5 GHz
 # baseline is ~10 KB, kept in its own NVS partition within the 4 MB flash.
 jd_nvs,   data, nvs,     0x290000, 256K,
+# Two-sector scratch the bootloader writes atomically to pick the ota slot to
+# boot; with CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE it rolls back to the other
+# slot when an upgraded app never confirms itself (main/ota_upgrade.c).
+otadata,  data, ota,     0x2d0000, 0x2000,

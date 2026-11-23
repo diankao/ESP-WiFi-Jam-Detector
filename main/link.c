@@ -26,6 +26,7 @@
 #include "detector.h"
 #include "link.h"
 #include "link_proto.h"
+#include "ota_upgrade.h"
 #include "params.h"
 #include "settings.h"
 #include "sweep.h"
@@ -45,7 +46,7 @@ static const char *TAG = "link";
 #define TASK_PRIO       2
 #define WRITE_PRIO      12   /* while holding the radio-quiet token (as eventlog.c) */
 #define WRITER_STACK    3072 /* ~1.1 KB used (measured) */
-#define READER_STACK    3072 /* ~1.5 KB used, with a settings save */
+#define READER_STACK    4096 /* ~1.5 KB used; the OTA path (esp_ota_*) is stack-hungry */
 #define QUIET_MS        200  /* give up on this message if no window comes */
 #define TX_DONE_MS      20   /* host reading: a 2 KB line takes ~2 ms at full speed */
 #define POLL_MS         250
@@ -55,7 +56,7 @@ static const char *TAG = "link";
 #define TX_BUF          2048 /* driver ring buffers (logs share the TX one) */
 #define RX_BUF          512
 
-typedef enum { ITEM_EVENT, ITEM_HELLO, ITEM_ACK, ITEM_SPEC } item_kind_t;
+typedef enum { ITEM_EVENT, ITEM_HELLO, ITEM_ACK, ITEM_SPEC, ITEM_OACK } item_kind_t;
 
 typedef struct {
     item_kind_t kind;
@@ -63,6 +64,7 @@ typedef struct {
     int id;          /* ITEM_ACK */
     const char *err; /* ITEM_ACK: static string, NULL = ok */
     detect_event_t ev;
+    link_oack_t oack; /* ITEM_OACK */
 } item_t;
 
 static QueueHandle_t s_queue;
@@ -108,6 +110,13 @@ void link_post_event(band_id_t band, const detect_event_t *ev)
 static void post_ack(int id, const char *err)
 {
     const item_t it = {.kind = ITEM_ACK, .id = id, .err = err};
+    post(&it);
+}
+
+/* OTA engine -> writer queue (registered with ota_set_ack_cb at link start). */
+static void post_oack(const link_oack_t *ack)
+{
+    const item_t it = {.kind = ITEM_OACK, .oack = *ack};
     post(&it);
 }
 
@@ -221,12 +230,18 @@ static void send_item(const item_t *it)
     case ITEM_EVENT:
         send_line(link_fmt_event(s_line, sizeof(s_line), it->band, &it->ev, settings_boot()));
         break;
-    case ITEM_HELLO:
-        send_line(link_fmt_hello(s_line, sizeof(s_line), s_id, esp_app_get_description()->version, MODEL));
+    case ITEM_HELLO: {
+        link_ota_info_t ota;
+        send_line(link_fmt_hello(s_line, sizeof(s_line), s_id, esp_app_get_description()->version, MODEL,
+                                 ota_info(&ota) ? &ota : NULL));
         atomic_store(&s_status_due, true);
         break;
+    }
     case ITEM_ACK:
         send_line(link_fmt_ack(s_line, sizeof(s_line), it->id, it->err));
+        break;
+    case ITEM_OACK:
+        send_line(link_fmt_oack(s_line, sizeof(s_line), &it->oack));
         break;
     case ITEM_SPEC:
         send_spec(it->band);
@@ -353,6 +368,36 @@ static void run(const char *line)
         atomic_store(&s_status_due, true);
         return;
     }
+    if (!strcmp(cmd.c, "ota_begin")) {
+        if (!cmd.has_v || cmd.v <= 0) {
+            post_ack(cmd.id, "missing v");
+            return;
+        }
+        const char *err = NULL;
+        const esp_err_t oerr = ota_begin(cmd.id, (uint32_t)cmd.v, &err);
+        /* On success the reader switches to binary frames until the transfer
+         * ends; the ack is sent after the target slot is erased, which can
+         * take seconds (the erase freezes the CPU). */
+        post_ack(cmd.id, oerr == ESP_OK ? NULL : err ? err : "failed");
+        atomic_store(&s_status_due, true);
+        return;
+    }
+    if (!strcmp(cmd.c, "ota_abort")) {
+        ota_abort();
+        post_ack(cmd.id, NULL);
+        atomic_store(&s_status_due, true);
+        return;
+    }
+    if (!strcmp(cmd.c, "ota_reboot")) {
+        post_ack(cmd.id, NULL);
+        ota_reboot(100); /* let the ack drain, then reset */
+        return;
+    }
+    if (!strcmp(cmd.c, "ota_confirm")) {
+        const esp_err_t oerr = ota_confirm();
+        post_ack(cmd.id, oerr == ESP_OK ? NULL : "no ota");
+        return;
+    }
     post_ack(cmd.id, "unknown command");
 }
 
@@ -364,7 +409,22 @@ static void reader_task(void *arg)
     bool overflow = false;
     for (;;) {
         uint8_t buf[64];
-        const int got = usb_serial_jtag_read_bytes(buf, sizeof(buf), portMAX_DELAY);
+        /* While an OTA transfer is active every byte is a binary frame, and
+         * the read times out so a vanished host aborts it (link stays idle
+         * otherwise: portMAX_DELAY, no wakeups). */
+        const int got = usb_serial_jtag_read_bytes(buf, sizeof(buf),
+                                                   ota_active() ? pdMS_TO_TICKS(OTA_IDLE_TIMEOUT_MS)
+                                                                : portMAX_DELAY);
+        if (got <= 0) {
+            if (ota_active()) {
+                ota_rx(NULL, 0); /* idle timeout: abort, resume the sweep */
+            }
+            continue;
+        }
+        if (ota_active()) {
+            ota_rx(buf, (size_t)got);
+            continue;
+        }
         for (int i = 0; i < got; i++) {
             const char c = (char)buf[i];
             if (c == '\n' || c == '\r') {
@@ -399,6 +459,7 @@ esp_err_t link_start(void)
 
     s_queue = xQueueCreate(QUEUE_LEN, sizeof(item_t));
     ESP_RETURN_ON_FALSE(s_queue, ESP_ERR_NO_MEM, TAG, "queue");
+    ota_set_ack_cb(post_oack);
     ESP_RETURN_ON_FALSE(xTaskCreate(writer_task, "link_tx", WRITER_STACK, NULL, TASK_PRIO, NULL) == pdPASS,
                         ESP_ERR_NO_MEM, TAG, "writer task");
     ESP_RETURN_ON_FALSE(xTaskCreate(reader_task, "link_rx", READER_STACK, NULL, TASK_PRIO, NULL) == pdPASS,

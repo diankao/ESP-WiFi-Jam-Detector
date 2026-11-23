@@ -33,6 +33,7 @@
 #endif
 #include "link.h"
 #include "espsdr_rx.h"
+#include "ota_upgrade.h"
 #include "settings.h"
 #include "sweep.h"
 
@@ -124,6 +125,9 @@ static esp_err_t start(void)
     ESP_RETURN_ON_ERROR(link_start(), TAG, "USB link");
     ESP_RETURN_ON_ERROR(board_backlight_set(set.brightness), TAG, "backlight");
 #endif
+    /* If we were booted by an OTA upgrade we are PENDING_VERIFY: arm the
+     * self-check that confirms the image (or leaves it to roll back). */
+    ota_boot_check();
     return ESP_OK;
 }
 
